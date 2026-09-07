@@ -36,6 +36,7 @@ from llmport.errors import (
     TransientError,
     TransportError,
 )
+from llmport.transports import build_ssl_context, urllib_transport
 
 __all__ = [
     "AsyncLLMProvider",
@@ -59,4 +60,6 @@ __all__ = [
     "TransientError",
     "TransportError",
     "Usage",
+    "build_ssl_context",
+    "urllib_transport",
 ]

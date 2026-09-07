@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from http import HTTPStatus
 from typing import Any
 
@@ -38,11 +38,10 @@ from llmport.errors import (
     RateLimitedError,
     ServerError,
 )
+from llmport.transports import HttpResponse, SyncTransport
 
-HttpResponse = tuple[int, Mapping[str, str], bytes]
-"""Ответ транспорта: статус, заголовки, тело."""
-
-SyncTransport = Callable[[str, Mapping[str, str], bytes, float | None], HttpResponse]
+__all__ = ["HttpResponse", "OpenAICompatible", "SyncTransport", "build_payload", "parse_response"]
+"""Тип транспорта переехал в llmport.transports, здесь он остаётся ради прежних импортов."""
 
 
 def build_payload(request: Request, model: str) -> dict[str, Any]:

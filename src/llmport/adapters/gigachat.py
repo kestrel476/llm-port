@@ -20,6 +20,23 @@
 смысл: сертификаты Минцифры в системном хранилище обычно отсутствуют, и хосту нужно
 задать корневой сертификат явно. Прятать `verify=False` внутрь библиотеки нельзя —
 отключение проверки должно быть видимым решением сервиса.
+
+# Два контура, два способа авторизации
+
+Снаружи ключ меняется на токен. Во внутреннем контуре токена нет вовсе: клиентский
+сертификат и приватный ключ предъявляются при установлении соединения, обменивать и
+обновлять нечего, а заголовок `Authorization` эндпоинт не ждёт. Способ выбирается по
+тому, передан ли `tokens`:
+
+    GigaChat(tokens=TokenCache(...), transport=...)   внешний контур
+    GigaChat(transport=mtls_transport)                внутренний контур
+
+Практические следствия, из-за которых это не сводится к «не слать заголовок». Ошибка
+выглядит иначе: не 401, а обрыв рукопожатия, и сообщение будет про TLS, а не про доступ.
+Логика обновления токена не нужна, но код, который её ждёт, без неё падает. И адрес по
+умолчанию у контуров разный, поэтому он выбирается вместе со способом.
+
+TLS-контекст с клиентским сертификатом собирается в `llmport.transports.build_ssl_context`.
 """
 
 from __future__ import annotations
@@ -31,7 +48,6 @@ import uuid
 from http import HTTPStatus
 from typing import Any
 
-from llmport.adapters.openai_compatible import SyncTransport
 from llmport.contract import Capabilities, Completion, Message, Request, ToolCall, Usage
 from llmport.errors import (
     AuthError,
@@ -41,9 +57,12 @@ from llmport.errors import (
     RateLimitedError,
     ServerError,
 )
+from llmport.transports import SyncTransport
 
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 API_URL = "https://gigachat.devices.sberbank.ru/api/v1"
+INTERNAL_API_URL = "https://gigachat-ift.sberdevices.delta.sbrf.ru/v1"
+"""Адрес внутреннего контура. Берётся по умолчанию, когда авторизация идёт сертификатом."""
 
 SCOPE_PERSONAL = "GIGACHAT_API_PERS"
 SCOPE_BUSINESS = "GIGACHAT_API_B2B"
@@ -191,24 +210,36 @@ class TokenCache:
 
 
 class GigaChat:
-    """Синхронный провайдер GigaChat поверх переданного транспорта."""
+    """Синхронный провайдер GigaChat поверх переданного транспорта.
+
+    Без `tokens` работает по клиентскому сертификату: заголовок авторизации не
+    отправляется, потому что соединение уже аутентифицировано рукопожатием. Транспорт
+    в этом режиме обязан нести TLS-контекст с сертификатом, см. `llmport.transports`.
+    """
 
     __slots__ = ("_api_url", "_model", "_timeout_s", "_tokens", "_transport")
 
     def __init__(
         self,
         *,
-        tokens: TokenCache,
         transport: SyncTransport,
+        tokens: TokenCache | None = None,
         model: str = "GigaChat-2-Max",
-        api_url: str = API_URL,
+        api_url: str | None = None,
         timeout_s: float = 60.0,
     ) -> None:
         self._tokens = tokens
         self._transport = transport
         self._model = model
-        self._api_url = api_url.rstrip("/")
+        # Адрес выбирается вместе со способом авторизации: у контуров он разный, и
+        # заставлять сервис помнить об этом значит собирать ошибку на ровном месте.
+        self._api_url = (api_url or (API_URL if tokens is not None else INTERNAL_API_URL)).rstrip("/")
         self._timeout_s = timeout_s
+
+    @property
+    def mutual_tls(self) -> bool:
+        """Авторизует ли соединение клиентский сертификат, а не токен."""
+        return self._tokens is None
 
     @property
     def model(self) -> str:
@@ -237,6 +268,15 @@ class GigaChat:
             url, self._headers(), body, request.timeout_s or self._timeout_s
         )
         if status == HTTPStatus.UNAUTHORIZED:
+            if self._tokens is None:
+                # Обновлять нечего: авторизует сертификат. Отказ означает, что контур
+                # его не принял, и повтор ничего не изменит.
+                raise AuthError(
+                    "контур отверг клиентский сертификат: проверьте его срок и то, "
+                    "что он выдан на этот стенд",
+                    provider="gigachat",
+                    model=self._model,
+                )
             # Срок мог выйти раньше расчётного — обновляемся и пробуем ещё раз.
             # Ровно одна попытка: если и она даёт 401, дело в ключе, а не в сроке.
             self._tokens.refresh()
@@ -253,16 +293,22 @@ class GigaChat:
         """
         status, _headers, raw = self._transport(f"{self._api_url}/models", self._headers(), b"", 30.0)
         if status != HTTPStatus.OK:
+            if status == HTTPStatus.UNAUTHORIZED and self._tokens is None:
+                raise AuthError(
+                    "контур отверг клиентский сертификат: проверьте его срок и то, "
+                    "что он выдан на этот стенд",
+                    provider="gigachat",
+                    model=self._model,
+                )
             raise _error_for(status, raw, model=self._model)
         data = json.loads(raw.decode("utf-8"))
         return tuple(str(item["id"]) for item in data.get("data", []))
 
     def _headers(self) -> dict[str, str]:
-        return {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self._tokens.token()}",
-        }
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._tokens is not None:
+            headers["Authorization"] = f"Bearer {self._tokens.token()}"
+        return headers
 
 
 # ── внутреннее ───────────────────────────────────────────────────────────────

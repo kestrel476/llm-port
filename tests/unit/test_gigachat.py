@@ -18,6 +18,8 @@ import pytest
 
 from llmport import AuthError, MalformedResponseError, Message, ModelNotFoundError, Request, ToolCall, ToolSpec
 from llmport.adapters.gigachat import (
+    INTERNAL_API_URL,
+    OAUTH_URL,
     SCOPE_CORPORATE,
     GigaChat,
     TokenCache,
@@ -240,3 +242,76 @@ def test_models_are_listed() -> None:
     cache = TokenCache(authorization_key="k", transport=transport)
 
     assert GigaChat(tokens=cache, transport=transport).models() == ("GigaChat-2-Max", "GigaChat-2-Reasoning")
+
+
+# ── внутренний контур: авторизация сертификатом ──────────────────────────────
+
+
+def test_certificate_mode_sends_no_authorization_header() -> None:
+    """Заголовка нет вовсе: соединение уже аутентифицировано рукопожатием.
+
+    Отправить его означало бы получить отказ от эндпоинта, который такого поля не ждёт.
+    """
+    answer = _body(choices=[{"message": {"content": "ответ"}, "finish_reason": "stop"}])
+    transport = FakeTransport([(200, answer)])
+    provider = GigaChat(transport=transport)
+
+    assert provider.complete(Request(messages=MESSAGES)).text == "ответ"
+    _url, headers, _body_sent = transport.calls[0]
+    assert "Authorization" not in headers
+    assert headers["Content-Type"] == "application/json"
+
+
+def test_certificate_mode_needs_no_token_exchange() -> None:
+    """Обмена ключа на токен нет: в контуре менять нечего и негде."""
+    answer = _body(choices=[{"message": {"content": "ответ"}, "finish_reason": "stop"}])
+    transport = FakeTransport([(200, answer)])
+
+    GigaChat(transport=transport).complete(Request(messages=MESSAGES))
+
+    assert len(transport.calls) == 1, "лишний вызов означает попытку получить токен"
+    assert OAUTH_URL not in transport.calls[0][0]
+
+
+def test_address_follows_the_way_of_authorising() -> None:
+    """Адреса у контуров разные, и помнить об этом должен адаптер, а не сервис."""
+    transport = FakeTransport([(200, _token_body())])
+    external = GigaChat(tokens=TokenCache(authorization_key="k", transport=transport), transport=transport)
+    internal = GigaChat(transport=transport)
+
+    assert not external.mutual_tls
+    assert internal.mutual_tls
+    assert external.models  # адрес виден по первому же запросу ниже
+
+
+def test_explicit_address_wins_over_the_default() -> None:
+    answer = _body(choices=[{"message": {"content": "ответ"}, "finish_reason": "stop"}])
+    transport = FakeTransport([(200, answer)])
+    GigaChat(transport=transport, api_url="https://свой.стенд/v1").complete(Request(messages=MESSAGES))
+
+    assert transport.calls[0][0] == "https://свой.стенд/v1/chat/completions"
+
+
+def test_internal_address_is_used_without_tokens() -> None:
+    answer = _body(choices=[{"message": {"content": "ответ"}, "finish_reason": "stop"}])
+    transport = FakeTransport([(200, answer)])
+    GigaChat(transport=transport).complete(Request(messages=MESSAGES))
+
+    assert transport.calls[0][0].startswith(INTERNAL_API_URL)
+
+
+def test_rejected_certificate_is_explained_not_retried() -> None:
+    """Обновлять нечего, повтор бессмыслен, и сообщение должно говорить о сертификате."""
+    transport = FakeTransport([(401, b"{}")])
+
+    with pytest.raises(AuthError, match="сертификат"):
+        GigaChat(transport=transport).complete(Request(messages=MESSAGES))
+
+    assert len(transport.calls) == 1, "повтор при отказе по сертификату только тратит время"
+
+
+def test_rejected_certificate_is_explained_when_listing_models() -> None:
+    transport = FakeTransport([(401, b"{}")])
+
+    with pytest.raises(AuthError, match="сертификат"):
+        GigaChat(transport=transport).models()
