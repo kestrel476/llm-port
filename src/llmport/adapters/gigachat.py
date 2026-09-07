@@ -42,6 +42,7 @@ TLS-контекст с клиентским сертификатом собир
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.parse
 import uuid
@@ -59,16 +60,71 @@ from llmport.errors import (
 )
 from llmport.transports import SyncTransport
 
+# ── адреса и области доступа ─────────────────────────────────────────────────
+#
+# Ничего из этого не зашито намертво. Порядок такой: явный аргумент главнее
+# переменной окружения, переменная главнее встроенного умолчания. Так стенд можно
+# сменить, не трогая код, но и не терять управление там, где адрес задаётся явно.
+#
+# Окружение читается при ВЫЗОВЕ, а не при импорте. Разница существенная: при чтении
+# на импорте порядок импортов начинает влиять на поведение, а тесты не могут
+# подменить переменную, потому что модуль уже загружен.
+
+ENV_OAUTH_URL = "GIGACHAT_OAUTH_URL"
+ENV_AUTH_URL = "GIGACHAT_AUTH_URL"
+"""Прежнее имя той же переменной. Признаётся, чтобы не ломать заполненные .env."""
+
+ENV_API_URL = "GIGACHAT_API_URL"
+ENV_INTERNAL_API_URL = "GIGACHAT_INTERNAL_API_URL"
+ENV_SCOPE = "GIGACHAT_SCOPE"
+
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+"""Встроенное умолчание для обмена ключа на токен. Перекрывается GIGACHAT_OAUTH_URL."""
+
 API_URL = "https://gigachat.devices.sberbank.ru/api/v1"
+"""Встроенное умолчание внешнего контура. Перекрывается GIGACHAT_API_URL."""
+
 INTERNAL_API_URL = "https://gigachat-ift.sberdevices.delta.sbrf.ru/v1"
-"""Адрес внутреннего контура. Берётся по умолчанию, когда авторизация идёт сертификатом."""
+"""Встроенное умолчание внутреннего контура: берётся, когда авторизация идёт
+сертификатом. Перекрывается GIGACHAT_INTERNAL_API_URL. Адрес внутреннего стенда почти
+всегда свой, поэтому менять его через окружение приходится чаще остальных."""
 
 SCOPE_PERSONAL = "GIGACHAT_API_PERS"
 SCOPE_BUSINESS = "GIGACHAT_API_B2B"
 SCOPE_CORPORATE = "GIGACHAT_API_CORP"
-"""Области доступа. Ключ обычно открыт ровно под одну; на чужой сервер отвечает
-`scope from db not fully includes consumed scope`, а не внятной ошибкой доступа."""
+"""Области доступа. Это значения протокола, а не настройка: сервер ждёт ровно такие
+строки. Настройкой служит ВЫБОР одной из них, он и берётся из GIGACHAT_SCOPE. Ключ
+обычно открыт ровно под одну область; на чужую сервер отвечает `scope from db not fully
+includes consumed scope`, а не внятной ошибкой доступа."""
+
+DEFAULT_SCOPE = SCOPE_CORPORATE
+"""Какая область берётся, если ни аргумент, ни GIGACHAT_SCOPE не заданы."""
+
+
+def _from_env(*names: str) -> str:
+    """Первое непустое значение из перечисленных переменных окружения."""
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def resolve_oauth_url(explicit: str | None = None) -> str:
+    """Адрес обмена ключа на токен: аргумент, затем окружение, затем умолчание."""
+    return explicit or _from_env(ENV_OAUTH_URL, ENV_AUTH_URL) or OAUTH_URL
+
+
+def resolve_api_url(explicit: str | None = None, *, mutual_tls: bool = False) -> str:
+    """Адрес модели. Контур определяет, какое умолчание и какая переменная в ходу."""
+    if mutual_tls:
+        return explicit or _from_env(ENV_INTERNAL_API_URL, ENV_API_URL) or INTERNAL_API_URL
+    return explicit or _from_env(ENV_API_URL) or API_URL
+
+
+def resolve_scope(explicit: str | None = None) -> str:
+    """Область доступа ключа."""
+    return explicit or _from_env(ENV_SCOPE) or DEFAULT_SCOPE
 
 
 def build_payload(request: Request, model: str) -> dict[str, Any]:
@@ -161,14 +217,14 @@ class TokenCache:
         *,
         authorization_key: str,
         transport: SyncTransport,
-        scope: str = SCOPE_CORPORATE,
-        oauth_url: str = OAUTH_URL,
+        scope: str | None = None,
+        oauth_url: str | None = None,
         refresh_margin_s: float = 60.0,
     ) -> None:
         self._authorization_key = authorization_key
         self._transport = transport
-        self._scope = scope
-        self._url = oauth_url
+        self._scope = resolve_scope(scope)
+        self._url = resolve_oauth_url(oauth_url)
         self._margin_s = refresh_margin_s
         self._token: str | None = None
         self._expires_at: float = 0.0
@@ -233,7 +289,7 @@ class GigaChat:
         self._model = model
         # Адрес выбирается вместе со способом авторизации: у контуров он разный, и
         # заставлять сервис помнить об этом значит собирать ошибку на ровном месте.
-        self._api_url = (api_url or (API_URL if tokens is not None else INTERNAL_API_URL)).rstrip("/")
+        self._api_url = resolve_api_url(api_url, mutual_tls=tokens is None).rstrip("/")
         self._timeout_s = timeout_s
 
     @property

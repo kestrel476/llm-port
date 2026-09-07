@@ -18,16 +18,40 @@ import pytest
 
 from llmport import AuthError, MalformedResponseError, Message, ModelNotFoundError, Request, ToolCall, ToolSpec
 from llmport.adapters.gigachat import (
+    API_URL,
+    DEFAULT_SCOPE,
+    ENV_API_URL,
+    ENV_AUTH_URL,
+    ENV_INTERNAL_API_URL,
+    ENV_OAUTH_URL,
+    ENV_SCOPE,
     INTERNAL_API_URL,
     OAUTH_URL,
+    SCOPE_BUSINESS,
     SCOPE_CORPORATE,
+    SCOPE_PERSONAL,
     GigaChat,
     TokenCache,
     build_payload,
     parse_response,
+    resolve_api_url,
+    resolve_oauth_url,
+    resolve_scope,
 )
 
 MESSAGES = [Message(role="user", content="классифицируй документ")]
+
+
+@pytest.fixture(autouse=True)
+def clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Чистое окружение на каждый тест.
+
+    Адреса теперь читаются из переменных при вызове, и оставленная в оболочке
+    GIGACHAT_API_URL, которая вполне может быть у разработчика, роняла бы проверки
+    умолчаний. Тест не должен зависеть от того, на какой стенд человек смотрел вчера.
+    """
+    for name in (ENV_OAUTH_URL, ENV_AUTH_URL, ENV_API_URL, ENV_INTERNAL_API_URL, ENV_SCOPE):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _body(**payload: object) -> bytes:
@@ -315,3 +339,74 @@ def test_rejected_certificate_is_explained_when_listing_models() -> None:
 
     with pytest.raises(AuthError, match="сертификат"):
         GigaChat(transport=transport).models()
+
+
+# ── адреса и области доступа из окружения ────────────────────────────────────
+
+
+def test_explicit_address_beats_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Порядок важен: окружение снимает необходимость править код, но не отбирает
+    управление там, где адрес задан явно."""
+    monkeypatch.setenv(ENV_API_URL, "https://из-окружения/v1")
+    assert resolve_api_url("https://явно/v1") == "https://явно/v1"
+
+
+def test_environment_beats_the_built_in_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_API_URL, "https://из-окружения/v1")
+    assert resolve_api_url() == "https://из-окружения/v1"
+    monkeypatch.delenv(ENV_API_URL)
+    assert resolve_api_url() == API_URL
+
+
+def test_internal_contour_has_its_own_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Адрес внутреннего стенда почти всегда свой, и задавать его надо, не задев внешний."""
+    monkeypatch.setenv(ENV_INTERNAL_API_URL, "https://внутренний.стенд/v1")
+    assert resolve_api_url(mutual_tls=True) == "https://внутренний.стенд/v1"
+    assert resolve_api_url() == API_URL
+
+
+def test_general_variable_covers_the_internal_contour_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Когда сервис живёт только внутри, отдельная переменная ему не нужна."""
+    monkeypatch.setenv(ENV_API_URL, "https://единственный.стенд/v1")
+    assert resolve_api_url(mutual_tls=True) == "https://единственный.стенд/v1"
+
+
+def test_oauth_url_accepts_both_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Прежнее имя признаётся, чтобы не ломать уже заполненные .env."""
+    monkeypatch.setenv(ENV_AUTH_URL, "https://старое-имя/oauth")
+    assert resolve_oauth_url() == "https://старое-имя/oauth"
+    monkeypatch.setenv(ENV_OAUTH_URL, "https://новое-имя/oauth")
+    assert resolve_oauth_url() == "https://новое-имя/oauth"
+
+
+def test_scope_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_SCOPE, SCOPE_PERSONAL)
+    assert resolve_scope() == SCOPE_PERSONAL
+    assert resolve_scope(SCOPE_BUSINESS) == SCOPE_BUSINESS
+    monkeypatch.delenv(ENV_SCOPE)
+    assert resolve_scope() == DEFAULT_SCOPE
+
+
+def test_blank_variable_does_not_shadow_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Пустая строка в .env это незаполненное поле, а не адрес."""
+    monkeypatch.setenv(ENV_API_URL, "   ")
+    assert resolve_api_url() == API_URL
+
+
+def test_provider_takes_the_address_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_INTERNAL_API_URL, "https://свой.контур/v1")
+    answer = _body(choices=[{"message": {"content": "ответ"}, "finish_reason": "stop"}])
+    transport = FakeTransport([(200, answer)])
+
+    GigaChat(transport=transport).complete(Request(messages=MESSAGES))
+
+    assert transport.calls[0][0] == "https://свой.контур/v1/chat/completions"
+
+
+def test_token_cache_takes_the_address_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_OAUTH_URL, "https://свой.oauth/token")
+    transport = FakeTransport([(200, _token_body())])
+
+    TokenCache(authorization_key="k", transport=transport).token()
+
+    assert transport.calls[0][0] == "https://свой.oauth/token"
